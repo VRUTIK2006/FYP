@@ -27,3 +27,13 @@ SENTINEL_VALUES = {
 
 # Long unresolved gaps are deliberately not auto-imputed.
 MAX_INTERPOLATION_GAP = 6
+
+
+# Multi-point regional clusters representing Gujarat's wind & solar generation hubs.
+# Used for state-wide aggregate weather forecasting when no single plant location is specified.
+DEFAULT_WEATHER_CLUSTERS = [
+    {"name": "Kutch Wind Hub", "latitude": 23.25, "longitude": 69.67, "weight": 0.40},
+    {"name": "Jamnagar/Saurashtra Coast", "latitude": 22.47, "longitude": 70.06, "weight": 0.30},
+    {"name": "Bhavnagar Gulf Corridor", "latitude": 21.76, "longitude": 72.15, "weight": 0.20},
+    {"name": "Central Gujarat", "latitude": 22.30, "longitude": 71.50, "weight": 0.10},
+]

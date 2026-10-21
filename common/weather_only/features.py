@@ -89,6 +89,7 @@ def _solar(df: pd.DataFrame, cal: pd.DataFrame) -> pd.DataFrame:
         f[c] = df[c]
     kt = (allsky / clear.where(clear > 1.0)).clip(0, 1.5)
     f["clear_sky_index"] = kt.fillna(0.0)
+    f["diffuse_proxy"] = np.maximum(0.0, clear - allsky)
     f["is_daylight"] = (clear > 1.0).astype(int)
     for c in ["hour_sin", "hour_cos", "day_of_year_sin", "day_of_year_cos",
               "hour", "month"]:
@@ -100,16 +101,34 @@ def _wind(df: pd.DataFrame, cal: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     for c in ["WS50M", "WS10M", "T2M", "PS", "RH2M", "PRECTOTCORR"]:
         f[c] = df[c]
-    f["WS50M_cube"] = df["WS50M"] ** 3
-    f["WS10M_cube"] = df["WS10M"] ** 3
-    f["wind_shear_ratio"] = df["WS50M"] / df["WS10M"].clip(lower=0.1)
+
+    ws50 = df["WS50M"]
+    ws10 = df["WS10M"]
+    wd50_rad = np.deg2rad(df["WD50M"])
+    wd10_rad = np.deg2rad(df["WD10M"])
+
+    # Vector velocity components (Zonal u and Meridional v)
+    f["u50"] = -ws50 * np.sin(wd50_rad)
+    f["v50"] = -ws50 * np.cos(wd50_rad)
+    f["u10"] = -ws10 * np.sin(wd10_rad)
+    f["v10"] = -ws10 * np.cos(wd10_rad)
+
+    f["WS50M_cube"] = ws50 ** 3
+    f["WS10M_cube"] = ws10 ** 3
+
+    # Wind shear: ratio and logarithmic Hellman exponent
+    f["wind_shear_ratio"] = ws50 / ws10.clip(lower=0.1)
+    f["wind_shear_alpha"] = np.log(np.maximum(ws50 / ws10.clip(lower=0.1), 0.1)) / np.log(50.0 / 10.0)
+
     rho = df["PS"] * 1000.0 / (287.05 * (df["T2M"] + 273.15))  # PS is in kPa
     f["air_density"] = rho
-    f["wind_power_density"] = 0.5 * rho * df["WS50M"] ** 3
-    f["WD50M_sin"] = np.sin(np.deg2rad(df["WD50M"]))
-    f["WD50M_cos"] = np.cos(np.deg2rad(df["WD50M"]))
-    f["WD10M_sin"] = np.sin(np.deg2rad(df["WD10M"]))
-    f["WD10M_cos"] = np.cos(np.deg2rad(df["WD10M"]))
+    f["wind_power_density"] = 0.5 * rho * ws50 ** 3
+
+    f["WD50M_sin"] = np.sin(wd50_rad)
+    f["WD50M_cos"] = np.cos(wd50_rad)
+    f["WD10M_sin"] = np.sin(wd10_rad)
+    f["WD10M_cos"] = np.cos(wd10_rad)
+
     for c in ["hour_sin", "hour_cos", "day_of_year_sin", "day_of_year_cos",
               "hour", "month"]:
         f[c] = cal[c]

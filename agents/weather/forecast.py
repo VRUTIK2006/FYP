@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    DEFAULT_WEATHER_CLUSTERS,
     OPEN_METEO_BASE_URL,
     WEATHER_LATITUDE,
     WEATHER_LONGITUDE,
@@ -160,12 +161,18 @@ def _request_forecast(
                 f"Open-Meteo returned invalid JSON: {exc}"
             ) from exc
 
-    if not isinstance(payload, dict):
+    if not isinstance(payload, (dict, list)):
         raise OpenMeteoForecastError("Open-Meteo returned an invalid response object.")
-    if payload.get("error"):
+    if isinstance(payload, dict) and payload.get("error"):
         raise OpenMeteoForecastError(
             f"Open-Meteo forecast request failed: {payload.get('reason', 'unknown API error')}"
         )
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict) and item.get("error"):
+                raise OpenMeteoForecastError(
+                    f"Open-Meteo forecast request failed: {item.get('reason', 'unknown API error')}"
+                )
     return payload
 
 
@@ -353,41 +360,13 @@ def _resolve_wind_height(frame: pd.DataFrame) -> tuple[int, pd.Series, pd.Series
     return height, speed, direction
 
 
-def get_weather_forecast(
-    start_time: datetime | pd.Timestamp | str,
+def _normalize_single_forecast(
+    payload: dict[str, Any],
+    start: pd.Timestamp,
     horizon_hours: int,
-    *,
-    latitude: float | None = None,
-    longitude: float | None = None,
+    latitude: float,
+    longitude: float,
 ) -> pd.DataFrame:
-    """Fetch and normalize Open-Meteo hourly weather for the requested horizon.
-
-    ``start_time`` is the first requested forecast timestamp and must be an
-    aware, hourly-aligned datetime. Returned ``datetime`` values are aware in
-    ``Asia/Kolkata``. Wind height metadata is available in ``DataFrame.attrs``.
-    """
-    if (
-        isinstance(horizon_hours, bool)
-        or not isinstance(horizon_hours, Integral)
-        or horizon_hours not in SUPPORTED_HORIZONS
-    ):
-        raise ValueError(
-            "Unsupported weather forecast horizon. Use 1, 24, 168, or 360 hours."
-        )
-    horizon_hours = int(horizon_hours)
-
-    start = _to_local_hour(start_time)
-    latitude, longitude = _validate_coordinates(
-        WEATHER_LATITUDE if latitude is None else latitude,
-        WEATHER_LONGITUDE if longitude is None else longitude,
-    )
-    params = _build_request_params(start, horizon_hours, latitude, longitude)
-
-    logger.info("[WeatherAgent] Provider: Open-Meteo")
-    logger.info("[WeatherAgent] Forecast start: %s", start.isoformat())
-    logger.info("[WeatherAgent] Horizon: %s hours", horizon_hours)
-
-    payload = _request_forecast(params)
     hourly = _parse_hourly_response(payload, start, horizon_hours)
 
     normalized = pd.DataFrame(index=hourly.index)
@@ -456,8 +435,122 @@ def get_weather_forecast(
             "horizon_hours": horizon_hours,
         }
     )
+    return normalized
+
+
+def _aggregate_cluster_forecasts(frames: list[pd.DataFrame], weights: list[float]) -> pd.DataFrame:
+    w = np.array(weights, dtype=float)
+    w = w / w.sum()
+
+    base = frames[0].copy()
+    numeric_cols = [c for c in REQUIRED_COLUMNS if c not in {"datetime", "WD10M", "WD50M"}]
+
+    for col in numeric_cols:
+        base[col] = sum(weight * df[col].to_numpy() for weight, df in zip(w, frames))
+
+    for h in ["10", "50"]:
+        ws_col = f"WS{h}M"
+        wd_col = f"WD{h}M"
+        u_total = np.zeros(len(base))
+        v_total = np.zeros(len(base))
+        scalar_ws_total = np.zeros(len(base))
+
+        for weight, df in zip(w, frames):
+            spd = df[ws_col].to_numpy()
+            rad = np.deg2rad(df[wd_col].to_numpy())
+            u_total += weight * (-spd * np.sin(rad))
+            v_total += weight * (-spd * np.cos(rad))
+            scalar_ws_total += weight * spd
+
+        base[wd_col] = (np.rad2deg(np.arctan2(-u_total, -v_total)) + 360.0) % 360.0
+        base[ws_col] = scalar_ws_total
+
+    return base
+
+
+def get_weather_forecast(
+    start_time: datetime | pd.Timestamp | str,
+    horizon_hours: int,
+    *,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    clusters: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    """Fetch and normalize Open-Meteo hourly weather for the requested horizon.
+
+    When ``latitude`` and ``longitude`` are provided, fetches that specific single
+    location. When omitted, queries the multi-point regional renewable energy
+    clusters across Gujarat (Kutch, Saurashtra, Bhavnagar, Central) to provide a
+    state-wide aggregate weather representation matching the trained model domain.
+    """
+    if (
+        isinstance(horizon_hours, bool)
+        or not isinstance(horizon_hours, Integral)
+        or horizon_hours not in SUPPORTED_HORIZONS
+    ):
+        raise ValueError(
+            "Unsupported weather forecast horizon. Use 1, 24, 168, or 360 hours."
+        )
+    horizon_hours = int(horizon_hours)
+    start = _to_local_hour(start_time)
+
+    # 1. Single-location path (explicit coordinates or overridden)
+    if latitude is not None and longitude is not None:
+        latitude, longitude = _validate_coordinates(latitude, longitude)
+        params = _build_request_params(start, horizon_hours, latitude, longitude)
+        logger.info("[WeatherAgent] Provider: Open-Meteo (Single Location: %s, %s)", latitude, longitude)
+        logger.info("[WeatherAgent] Forecast start: %s", start.isoformat())
+        logger.info("[WeatherAgent] Horizon: %s hours", horizon_hours)
+        payload = _request_forecast(params)
+        normalized = _normalize_single_forecast(payload, start, horizon_hours, latitude, longitude)
+        logger.info("[WeatherAgent] Retrieved records: %s", len(normalized))
+        logger.info("[WeatherAgent] Wind height resolved: %sm", normalized.attrs["resolved_wind_height"])
+        logger.info("[WeatherAgent] Validation: PASSED")
+        return normalized
+
+    # 2. Multi-point cluster path (state-wide regional portfolio)
+    active_clusters = clusters or DEFAULT_WEATHER_CLUSTERS
+    lat_str = ",".join(str(c["latitude"]) for c in active_clusters)
+    lon_str = ",".join(str(c["longitude"]) for c in active_clusters)
+    weights = [c.get("weight", 1.0) for c in active_clusters]
+
+    params = _build_request_params(start, horizon_hours, lat_str, lon_str)
+    logger.info("[WeatherAgent] Provider: Open-Meteo (Multi-Point Regional Clusters)")
+    logger.info("[WeatherAgent] Clusters: %s", [c["name"] for c in active_clusters])
+    logger.info("[WeatherAgent] Forecast start: %s", start.isoformat())
+    logger.info("[WeatherAgent] Horizon: %s hours", horizon_hours)
+
+    payload = _request_forecast(params)
+    if isinstance(payload, list) and len(payload) == len(active_clusters):
+        frames = []
+        for item, c in zip(payload, active_clusters):
+            df_c = _normalize_single_forecast(item, start, horizon_hours, c["latitude"], c["longitude"])
+            frames.append(df_c)
+        normalized = _aggregate_cluster_forecasts(frames, weights)
+        normalized.attrs.update(
+            {
+                "weather_source": "open-meteo-multipoint-cluster",
+                "latitude": WEATHER_LATITUDE,
+                "longitude": WEATHER_LONGITUDE,
+                "cluster_count": len(active_clusters),
+                "clusters": [c["name"] for c in active_clusters],
+                "cluster_weights": weights,
+                "requested_wind_height": TARGET_WIND_HEIGHT,
+                "resolved_wind_height": frames[0].attrs["resolved_wind_height"],
+                "wind_height_fallback": frames[0].attrs["wind_height_fallback"],
+                "clear_sky_radiation_source": frames[0].attrs["clear_sky_radiation_source"],
+                "forecast_start": normalized["datetime"].iloc[0].isoformat(),
+                "forecast_end": normalized["datetime"].iloc[-1].isoformat(),
+                "horizon_hours": horizon_hours,
+            }
+        )
+    else:
+        # Fallback for mock responses or single-dict API replies
+        single_dict = payload[0] if isinstance(payload, list) else payload
+        normalized = _normalize_single_forecast(single_dict, start, horizon_hours, WEATHER_LATITUDE, WEATHER_LONGITUDE)
+
     logger.info("[WeatherAgent] Retrieved records: %s", len(normalized))
-    logger.info("[WeatherAgent] Wind height resolved: %sm", resolved_height)
+    logger.info("[WeatherAgent] Wind height resolved: %sm", normalized.attrs["resolved_wind_height"])
     logger.info("[WeatherAgent] Validation: PASSED")
     return normalized
 
