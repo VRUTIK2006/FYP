@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime
 from numbers import Integral
 from typing import Any
@@ -127,23 +128,37 @@ def _build_request_params(
     }
 
 
-def _request_forecast(params: dict[str, Any]) -> dict[str, Any]:
+def _request_forecast(
+    params: dict[str, Any], max_retries: int = 3
+) -> dict[str, Any]:
     url = f"{OPEN_METEO_BASE_URL}?{urlencode(params)}"
-    try:
-        with urlopen(url, timeout=WEATHER_REQUEST_TIMEOUT) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise OpenMeteoForecastError(
-            f"Open-Meteo forecast request failed: HTTP {exc.code} {exc.reason}"
-        ) from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise OpenMeteoForecastError(
-            f"Open-Meteo forecast request failed: {exc}"
-        ) from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise OpenMeteoForecastError(
-            f"Open-Meteo returned invalid JSON: {exc}"
-        ) from exc
+    payload = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urlopen(url, timeout=WEATHER_REQUEST_TIMEOUT) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except HTTPError as exc:
+            raise OpenMeteoForecastError(
+                f"Open-Meteo forecast request failed: HTTP {exc.code} {exc.reason}"
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            if attempt < max_retries:
+                logger.warning(
+                    "[WeatherAgent] Open-Meteo forecast request attempt %d failed (%s). Retrying in %ds...",
+                    attempt,
+                    exc,
+                    attempt * 2,
+                )
+                time.sleep(attempt * 2)
+            else:
+                raise OpenMeteoForecastError(
+                    f"Open-Meteo forecast request failed after {max_retries} attempts: {exc}"
+                ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OpenMeteoForecastError(
+                f"Open-Meteo returned invalid JSON: {exc}"
+            ) from exc
 
     if not isinstance(payload, dict):
         raise OpenMeteoForecastError("Open-Meteo returned an invalid response object.")

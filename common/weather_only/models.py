@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
 
 from .features import (
     DATETIME_COL,
@@ -253,9 +254,26 @@ def train_target(
     assert best is not None
 
     models = _fit_models(X.iloc[:a], y[:a] / level[:a], best)
-    # Calibrate the q10-q90 band on the validation block (never on test).
+    # Calibrate the q10-q90 band across pre-test history (never on test block).
+    # Cross-conformal calibration ensures the multi-season residual distribution
+    # (summer heatwaves, monsoon volatility) is represented rather than only a single season.
+    act = _is_active(target, frame)
     raw_low, raw_high = (models[k].predict(X.iloc[a:b]) * level[a:b] for k in ("q10", "q90"))
-    delta = conformal_delta(y[a:b], raw_low, raw_high, _is_active(target, frame.iloc[a:b]))
+    if target in {"demand", "wind"}:
+        oof_lo = np.zeros(a)
+        oof_hi = np.zeros(a)
+        kf = KFold(n_splits=3, shuffle=False)
+        for tr_idx, cal_idx in kf.split(X.iloc[:a]):
+            m_cv = _fit_models(X.iloc[tr_idx], y[tr_idx] / level[tr_idx], best)
+            oof_lo[cal_idx] = m_cv["q10"].predict(X.iloc[cal_idx]) * level[cal_idx]
+            oof_hi[cal_idx] = m_cv["q90"].predict(X.iloc[cal_idx]) * level[cal_idx]
+        all_y = np.concatenate([y[:a], y[a:b]])
+        all_lo = np.concatenate([oof_lo, raw_low])
+        all_hi = np.concatenate([oof_hi, raw_high])
+        all_act = np.concatenate([act[:a], act[a:b]])
+        delta = conformal_delta(all_y, all_lo, all_hi, all_act)
+    else:
+        delta = conformal_delta(y[a:b], raw_low, raw_high, act[a:b])
     scores: dict[str, Any] = {"band_widening_mu": delta}
     for name, sl in (("validation", slice(a, b)), ("test", slice(b, n))):
         point, low, high = _predict_raw(models, X.iloc[sl], level[sl], target,

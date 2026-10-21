@@ -120,8 +120,15 @@ def _demand(df: pd.DataFrame, cal: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     for c in ["T2M", "RH2M", "WS10M", "PRECTOTCORR"]:
         f[c] = df[c]
-    # Simple apparent-heat proxy: hot *and* humid hours drive cooling load.
-    f["heat_proxy"] = df["T2M"] * (1.0 + df["RH2M"] / 100.0)
+    # Thermal inertia & cooling degree features (major drivers of AC / power load)
+    t = df["T2M"]
+    f["T2M_roll24"] = t.rolling(24, min_periods=1).mean()
+    f["T2M_roll6"] = t.rolling(6, min_periods=1).mean()
+    f["T2M_diff24"] = t - f["T2M_roll24"]
+    f["cdd_24"] = np.maximum(0.0, t - 24.0)
+    f["cdd_roll24"] = f["cdd_24"].rolling(24, min_periods=1).mean()
+    # Apparent-heat proxy: hot and humid hours drive cooling load.
+    f["heat_proxy"] = t * (1.0 + df["RH2M"] / 100.0)
     for c in ["hour", "hour_sin", "hour_cos", "day_of_year_sin",
               "day_of_year_cos", "month", "day_of_week", "is_weekend",
               "is_holiday", "is_festival"]:
